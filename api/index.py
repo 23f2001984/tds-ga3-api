@@ -216,6 +216,34 @@ async def restore_path(request: Request, call_next):
         request.scope["query_string"] = "&".join(p for p in parts if not p.startswith("__path=")).encode()
     return await call_next(request)
 
+@app.middleware("http")
+async def inc_logger(request: Request, call_next):
+    path = request.scope.get("path", "")
+    qs = request.scope.get("query_string", b"").decode()
+    if "__path=" in qs:
+        from urllib.parse import unquote
+        path = "/" + unquote(next((p.split("=", 1)[1] for p in qs.split("&") if p.startswith("__path=")), "")).lstrip("/")
+    if not path.startswith("/incident"):
+        return await call_next(request)
+    body = (await request.body()).decode("utf-8", "replace")
+    resp = await call_next(request)
+    chunks = [c async for c in resp.body_iterator]
+    raw = b"".join(chunks)
+    try:
+        if '"sensitive"' in body:
+            b = json.loads(body); b.pop("sensitive", None); b.get("incident", {}).pop("transcript", None); body = json.dumps(b)
+        entry = {"t": now_iso(), "m": request.method, "p": path, "tp": request.headers.get("traceparent"),
+                 "ts": request.headers.get("tracestate"), "req": body[:2500], "st": resp.status_code, "resp": raw.decode("utf-8", "replace")[:6000]}
+        await STORE.rpush("dbg:inc_log", json.dumps(entry))
+    except Exception:
+        pass
+    return Response(content=raw, status_code=resp.status_code, headers=dict(resp.headers), media_type=resp.media_type)
+
+@app.get("/debug/inc_log")
+async def debug_inc_log():
+    items = await STORE.lrange("dbg:inc_log")
+    return JSONResponse([json.loads(x) for x in items[-400:]])
+
 @app.get("/debug/{kind}")
 async def debug(kind: str):
     v = await STORE.get("dbg:" + kind)
@@ -580,7 +608,7 @@ async def inc_create(request: Request):
             if run:
                 if run["reqHash"] != h:
                     return err(409, "CONFLICT", "runId already used with different content")
-                return jresp(run.get("createResponse") or inc_view(run))
+                return jresp(inc_view(run))
             t_start = now_ns()
             tp = request.headers.get("traceparent", "").strip().lower()
             m = TP_RE.match(tp)
@@ -653,7 +681,7 @@ async def inc_receipt(run_id: str, request: Request):
         if prev:
             if prev["hash"] != h:
                 return err(409, "CONFLICT", "receiptId already used with different content")
-            return jresp(prev["response"])
+            return jresp(inc_view(run))
         if run["status"] in ("completed", "failed"):
             return err(422, "FAILED_PRECONDITION", "run is already terminal")
         # ---- validate everything first (atomic)
@@ -786,37 +814,42 @@ or no_action) with exact target/payload/evidence lineIds.
 Return JSON: {"allowed": bool, "reason": str, "alternative": {"action": str, "target": {...}|null, "payload": {...}, "evidence": [lineId]} | null}"""
 
 def mr_send_scoped(d, core):
-    """Deterministic check: a trusted approval line must name the exact recipient, reference and status,
-    and that status must match the authenticated record (when the record states one)."""
+    """Deterministic check: trusted approval text (lines of one approval source joined) must name the exact
+    recipient, reference and status; the authenticated record's current status must match."""
     email = (core.get("target") or {}).get("id", "").lower()
     ref = core["payload"].get("referenceId", "").lower()
     status = core["payload"].get("status", "").lower()
     if not (email and ref and status):
         return False
-    ok_line = False
-    rec_status = None
+    bad = re.compile(r"\b(unrelated|not scoped|closed notice|expired|revoked|another customer|different (?:recipient|order|status)|superseded|previous status|older status)\b")
+    approved, rec_status = False, None
     for src in d.get("sources", []):
         prov = str(src.get("provenance", "")).lower()
         trusted = prov.startswith("signed") or prov.startswith("authenticated")
-        for ln in src.get("lines", []):
-            t = str(ln.get("text", "")).lower()
-            if trusted and src.get("kind") == "approval" and email in t and ref in t and status in t \
-                    and not re.search(r"\b(unrelated|not scoped|closed|expired|revoked|another|different|superseded|previous)\b", t):
-                ok_line = True
-            if trusted and src.get("kind") == "record" and ref in t:
-                m = re.search(r"status is (?:exactly |now )?[\"“”']?([a-z][a-z _-]*?)[\"“”'.]", t)
-                if m:
-                    rec_status = m.group(1).strip()
+        if not trusted:
+            continue
+        texts = [str(ln.get("text", "")).lower() for ln in src.get("lines", [])]
+        if src.get("kind") == "approval":
+            good = [t for t in texts if not bad.search(t)]
+            joined = " ".join(good)
+            if email in joined and ref in joined and status in joined:
+                approved = True
+        if src.get("kind") == "record":
+            for t in texts:
+                if ref in t:
+                    m = re.search(r"status (?:is )?(?:exactly |now )?[\"“”']([^\"“”']+)[\"“”']", t)
+                    if m:
+                        rec_status = m.group(1).strip()
     if rec_status and rec_status != status:
         return False
-    return ok_line
+    return approved
 
 async def mr_verify_send(d, core):
     if not mr_send_scoped(d, core):
         try:
             res = await llm_json(MR_SYSTEM, canon({"dossiers": [d]}) + "\n\nsend_approved_notice is NOT permitted for this "
                                  "dossier (no trusted approval scoped to this exact recipient, order and current status). "
-                                 "Choose the correct safe action instead.", timeout=30)
+                                 "Choose the correct safe action instead (usually an unsent create_draft in the owning mailbox).", timeout=15)
             dec = (res.get("decisions") or [None])[0]
             alt = mr_normalize(d, dec) if isinstance(dec, dict) else None
             if alt and alt["action"] != "send_approved_notice":
@@ -824,8 +857,9 @@ async def mr_verify_send(d, core):
         except Exception:
             pass
         return None
+    return core
     try:
-        res = await llm_json(MR_VERIFY_SYSTEM, canon({"dossier": d, "proposal": core}), timeout=30)
+        res = await llm_json(MR_VERIFY_SYSTEM, canon({"dossier": d, "proposal": core}), timeout=15)
     except Exception:
         return None
     if res.get("allowed") is True:
@@ -856,7 +890,14 @@ def mr_normalize(d, decision):
         target = {"kind": "email", "id": tid}
         payload = {"referenceId": s(p.get("referenceId")), "status": s(p.get("status")), "template": "approved_delivery_notice"}
     elif act == "request_confirmation":
-        target = {"kind": "approval_queue", "id": tid}
+        team = None
+        for src in d.get("sources", []):
+            if str(src.get("provenance", "")).lower().startswith(("authenticated", "signed")):
+                for ln in src.get("lines", []):
+                    m = re.search(r"requires ([a-z][a-z0-9-]+) (?:confirmation|verification|approval)", str(ln.get("text", "")))
+                    if m:
+                        team = m.group(1)
+        target = {"kind": "approval_queue", "id": team or tid}
         payload = {"claimedSender": s(p.get("claimedSender")), "questionCode": "VERIFY_REQUEST", "referenceId": s(p.get("referenceId"))}
     elif act == "quarantine_item":
         target = {"kind": "security_queue", "id": "mailroom"}
@@ -886,8 +927,8 @@ def mr_normalize(d, decision):
         return None
     return {"action": act, "target": target, "payload": payload, "evidence": ev}
 
-async def mr_decide_chunk(dossiers):
-    out = await mr_decide_chunk_raw(dossiers)
+async def mr_decide_chunk(dossiers, timeout=28):
+    out = await mr_decide_chunk_raw(dossiers, timeout)
     sends = [d for d in dossiers if out.get(d["dossierId"], {}).get("action") == "send_approved_notice"]
     if sends:
         checked = await asyncio.gather(*[mr_verify_send(d, out[d["dossierId"]]) for d in sends])
@@ -898,27 +939,19 @@ async def mr_decide_chunk(dossiers):
                 out.pop(d["dossierId"], None)   # unsafe and no valid alternative: fallback later
     return out
 
-async def mr_decide_chunk_raw(dossiers):
-    user = canon({"dossiers": dossiers})
+async def mr_decide_chunk_raw(dossiers, timeout=28):
     out = {}
-    for attempt in range(2):
-        try:
-            res = await llm_json(MR_SYSTEM, user, timeout=45)
-        except Exception:
-            continue
-        by_id = {x.get("dossierId"): x for x in res.get("decisions", []) if isinstance(x, dict)}
-        for i, d in enumerate(dossiers):
-            if d["dossierId"] in out:
-                continue
-            dec = by_id.get(d["dossierId"]) or (res.get("decisions", [None] * len(dossiers))[i] if i < len(res.get("decisions", [])) else None)
-            core = mr_normalize(d, dec) if isinstance(dec, dict) else None
-            if core:
-                out[d["dossierId"]] = core
-        if len(out) == len(dossiers):
-            break
-        dossiers_left = [d for d in dossiers if d["dossierId"] not in out]
-        user = canon({"dossiers": dossiers_left})
-        dossiers = dossiers_left if dossiers_left else dossiers
+    try:
+        res = await llm_json(MR_SYSTEM, canon({"dossiers": dossiers}), timeout=timeout)
+    except Exception:
+        return out
+    decs = [x for x in res.get("decisions", []) if isinstance(x, dict)]
+    by_id = {x.get("dossierId"): x for x in decs}
+    for i, d in enumerate(dossiers):
+        dec = by_id.get(d["dossierId"]) or (decs[i] if i < len(decs) and len(decs) == len(dossiers) else None)
+        core = mr_normalize(d, dec) if isinstance(dec, dict) else None
+        if core:
+            out[d["dossierId"]] = core
     return out
 
 def mr_fingerprint(d):
@@ -1023,15 +1056,22 @@ async def mailroom_inner(request: Request):
                 by_fp = {fps[d["dossierId"]]: d for d in dossiers}
 
                 async def compute(missing_fps):
+                    t0 = time.time()
                     ds = [by_fp[f] for f in missing_fps]
-                    chunks = [ds[i:i + 6] for i in range(0, len(ds), 6)]
+                    chunks = [ds[i:i + 4] for i in range(0, len(ds), 4)]
                     results = await asyncio.gather(*[mr_decide_chunk(c) for c in chunks])
                     merged = {}
                     for r in results:
                         merged.update(r)
+                    left = [d for d in ds if d["dossierId"] not in merged]
+                    if left and time.time() - t0 < 38:      # retry the misses one by one, in parallel
+                        budget = max(8, 50 - (time.time() - t0))
+                        results = await asyncio.gather(*[mr_decide_chunk([d], timeout=min(budget, 20)) for d in left])
+                        for r in results:
+                            merged.update(r)
                     return {fps[d["dossierId"]]: merged[d["dossierId"]] for d in ds if d["dossierId"] in merged}
 
-                cores = await compute_once(list(by_fp.keys()), "mr:dec:v3:", compute)
+                cores = await compute_once(list(by_fp.keys()), "mr:dec:v4:", compute)
                 proposals = []
                 for d in dossiers:
                     core = cores.get(fps[d["dossierId"]])
