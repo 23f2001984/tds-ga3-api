@@ -190,7 +190,7 @@ def _providers(model):
         out.append(("aipipe", AIPIPE_URL, tok, model))
     gk = os.environ.get("GEMINI_API_KEY")
     if gk:
-        gm = [m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-flash-lite-latest,gemini-flash-latest,gemini-2.5-flash").split(",") if m.strip()]
+        gm = [m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-flash-latest,gemini-2.5-flash,gemini-flash-lite-latest").split(",") if m.strip()]
         for m in gm:
             out.append(("gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", gk, m))
     return out
@@ -896,10 +896,45 @@ def mr_send_scoped(d, core):
                         rec_status = m.group(1).strip()
     if rec_status and rec_status != status:
         return False
+    # the person asking must be the approved recipient (approval for a different recipient is not valid)
+    for src in d.get("sources", []):
+        if src.get("kind") != "message":
+            continue
+        for ln in src.get("lines", []):
+            t = str(ln.get("text", "")).lower()
+            m = re.search(r"^from\s+([a-z0-9._%+-]+@[a-z0-9.-]+)", t) or re.search(r"sender address recorded by the gateway is\s+([a-z0-9._%+-]+@[a-z0-9.-]+[a-z])", t)
+            if m and m.group(1).rstrip(".") != email:
+                return False
     return approved
+
+def mr_draft_instead(d, core):
+    """Deterministic safe alternative to an unscoped send: unsent status draft in the owning mailbox."""
+    ref = core["payload"].get("referenceId", "")
+    req_email, msg_line, rec_line, rec_status, pol_line = None, None, None, None, None
+    for src in d.get("sources", []):
+        for ln in src.get("lines", []):
+            t = str(ln.get("text", ""))
+            if src.get("kind") == "message" and req_email is None:
+                m = re.search(r"^From\s+([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[A-Za-z])", t) or re.search(r"sender address recorded by the gateway is\s+([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[A-Za-z])", t)
+                if m:
+                    req_email, msg_line = m.group(1), ln["lineId"]
+            if src.get("kind") == "record" and ref and ref.lower() in t.lower() and rec_status is None:
+                m = re.search(r"status (?:is )?(?:exactly |now )?[\"“”']([^\"“”']+)[\"“”']", t)
+                if m:
+                    rec_status, rec_line = m.group(1).strip(), ln["lineId"]
+            if src.get("kind") == "policy" and "unsent status draft" in t.lower():
+                pol_line = ln["lineId"]
+    if not (req_email and rec_status and d.get("mailbox")):
+        return None
+    return {"action": "create_draft", "target": {"kind": "draft_queue", "id": "mailbox:" + str(d["mailbox"])},
+            "payload": {"recipient": req_email, "referenceId": ref, "status": rec_status, "template": "order_status"},
+            "evidence": [x for x in (pol_line, msg_line, rec_line) if x]}
 
 async def mr_verify_send(d, core):
     if not mr_send_scoped(d, core):
+        dr = mr_draft_instead(d, core)
+        if dr:
+            return dr
         try:
             res = await llm_json(MR_SYSTEM, canon({"dossiers": [d]}) + "\n\nsend_approved_notice is NOT permitted for this "
                                  "dossier (no trusted approval scoped to this exact recipient, order and current status). "
@@ -1134,6 +1169,9 @@ async def mailroom_inner(request: Request):
                         core = {"action": "no_action", "target": None,
                                 "payload": {"reasonCode": "INFORMATIONAL", "referenceId": ""},
                                 "evidence": [first_line] if first_line else []}
+                    if core.get("action") == "send_approved_notice" and not mr_send_scoped(d, core):
+                        core = mr_draft_instead(d, core) or {"action": "no_action", "target": None,
+                                "payload": {"reasonCode": "INFORMATIONAL", "referenceId": ""}, "evidence": core.get("evidence") or []}
                     proposals.append(mr_proposal(d, core))
                 resp = {"profile": MR_PROFILE, "evaluationId": eid, "status": "awaiting_receipts",
                         "inputDigest": sha(dossiers), "proposals": proposals}
