@@ -180,19 +180,64 @@ MODEL = os.environ.get("MODEL", "gpt-4.1")            # Q2/Q3 decisions (cached)
 INC_MODEL = os.environ.get("INC_MODEL", "gpt-4.1")  # Q4 planner (18 s budget)
 LLM_HOOK = None   # tests set this to a function(system, user, model) -> dict
 
+LAST_PROVIDER = {"v": None}
+_DEAD = {}   # provider/model -> time until which we skip it (quota exhausted)
+
+def _providers(model):
+    out = []
+    tok = os.environ.get("AIPIPE_TOKEN") or os.environ.get("OPENAI_API_KEY")
+    if tok:
+        out.append(("aipipe", AIPIPE_URL, tok, model))
+    gk = os.environ.get("GEMINI_API_KEY")
+    if gk:
+        gm = [m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-flash-lite-latest,gemini-flash-latest,gemini-2.5-flash").split(",") if m.strip()]
+        for m in gm:
+            out.append(("gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", gk, m))
+    return out
+
+def _parse_json(txt):
+    txt = (txt or "").strip()
+    if txt.startswith("```"):
+        txt = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", txt)
+    try:
+        return json.loads(txt)
+    except Exception:
+        i, j = txt.find("{"), txt.rfind("}")
+        return json.loads(txt[i:j + 1])
+
 async def llm_json(system: str, user: str, model: str | None = None, timeout: float = 40) -> dict:
     model = model or MODEL
     if LLM_HOOK:
         return LLM_HOOK(system, user, model)
-    token = os.environ.get("AIPIPE_TOKEN") or os.environ.get("OPENAI_API_KEY")
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        r = await c.post(AIPIPE_URL, headers={"Authorization": f"Bearer {token}"}, json={
-            "model": model, "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        })
-        r.raise_for_status()
-        return json.loads(r.json()["choices"][0]["message"]["content"])
+    t0 = time.time(); last = None
+    provs = _providers(model)
+    live = [p for p in provs if _DEAD.get(p[0] + p[3], 0) < time.time()] or provs
+    for name, url, tok, m in live:
+        left = timeout - (time.time() - t0)
+        if left < 2:
+            break
+        try:
+            async with httpx.AsyncClient(timeout=left) as c:
+                r = await c.post(url, headers={"Authorization": f"Bearer {tok}"}, json={
+                    "model": m, "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                })
+            if r.status_code in (401, 402, 403, 404, 429) or r.status_code >= 500:
+                if r.status_code != 500:
+                    _DEAD[name + m] = time.time() + (600 if r.status_code != 429 or name == "aipipe" else 30)
+                last = RuntimeError(f"{name}/{m} HTTP {r.status_code}: {r.text[:150]}")
+                continue
+            r.raise_for_status()
+            LAST_PROVIDER["v"] = f"{name}/{m}"
+            return _parse_json(r.json()["choices"][0]["message"]["content"])
+        except httpx.TimeoutException as e:
+            last = e
+            break
+        except Exception as e:
+            last = e
+            continue
+    raise last or RuntimeError("no LLM provider configured")
 
 async def dbg(kind, obj):
     """Keep the latest sample of each kind for /debug/<kind> (synthetic exam data only)."""
@@ -243,6 +288,15 @@ async def inc_logger(request: Request, call_next):
 async def debug_inc_log():
     items = await STORE.lrange("dbg:inc_log")
     return JSONResponse([json.loads(x) for x in items[-400:]])
+
+@app.get("/debug/llm_ping")
+async def debug_llm_ping():
+    t = time.time()
+    try:
+        out = await llm_json('Reply with JSON {"pong": true}.', "ping", INC_MODEL, 15)
+        return JSONResponse({"ok": True, "provider": LAST_PROVIDER["v"], "reply": out, "seconds": round(time.time() - t, 2)})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {str(e)[:300]}", "seconds": round(time.time() - t, 2)})
 
 @app.get("/debug/{kind}")
 async def debug(kind: str):
